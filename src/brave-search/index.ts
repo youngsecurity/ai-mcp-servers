@@ -86,28 +86,47 @@ if (!BRAVE_API_KEY) {
 }
 
 const RATE_LIMIT = {
-  perSecond: 1,
-  perMonth: 15000
+  perSecond: 50,
+  perMonth: Infinity  // Set to Infinity for unlimited monthly requests
 };
 
 let requestCount = {
   second: 0,
   month: 0,
-  lastReset: Date.now()
+  lastReset: Date.now(),
+  lastMonthReset: Date.now()
 };
 
 function checkRateLimit() {
   const now = Date.now();
+  // Reset per-second counter if more than 1 second has passed
   if (now - requestCount.lastReset > 1000) {
     requestCount.second = 0;
     requestCount.lastReset = now;
   }
-  if (requestCount.second >= RATE_LIMIT.perSecond ||
-    requestCount.month >= RATE_LIMIT.perMonth) {
-    throw new Error('Rate limit exceeded');
+  
+  // Reset monthly counter if more than 30 days have passed
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  if (now - requestCount.lastMonthReset > THIRTY_DAYS_MS) {
+    requestCount.month = 0;
+    requestCount.lastMonthReset = now;
   }
+  
+  // Check if we've exceeded the per-second rate limit
+  if (requestCount.second >= RATE_LIMIT.perSecond) {
+    throw new Error('Rate limit exceeded - too many requests per second');
+  }
+  
+  // Monthly limit check is disabled by setting perMonth to Infinity
+  // Uncomment and modify the following if monthly limits are needed in the future:
+  /*
+  if (requestCount.month >= RATE_LIMIT.perMonth) {
+    throw new Error('Rate limit exceeded - monthly request quota reached');
+  }
+  */
+  
   requestCount.second++;
-  requestCount.month++;
+  requestCount.month++;  // Still track monthly usage even though not enforcing a limit
 }
 
 interface BraveWeb {
@@ -219,32 +238,37 @@ async function performLocalSearch(query: string, count: number = 5) {
   webUrl.searchParams.set('result_filter', 'locations');
   webUrl.searchParams.set('count', Math.min(count, 20).toString());
 
-  const webResponse = await fetch(webUrl, {
-    headers: {
-      'Accept': 'application/json',
-      'Accept-Encoding': 'gzip',
-      'X-Subscription-Token': BRAVE_API_KEY
+  try {
+    const webResponse = await fetch(webUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip',
+        'X-Subscription-Token': BRAVE_API_KEY
+      }
+    });
+
+    if (!webResponse.ok) {
+      const responseText = await webResponse.text();
+      throw new Error(`Brave API error: ${webResponse.status} ${webResponse.statusText}\nResponse: ${responseText}`);
     }
-  });
 
-  if (!webResponse.ok) {
-    throw new Error(`Brave API error: ${webResponse.status} ${webResponse.statusText}\n${await webResponse.text()}`);
+    const webData = await webResponse.json() as BraveWeb;
+    const locationIds = webData.locations?.results?.filter((r): r is {id: string; title?: string} => r.id != null).map(r => r.id) || [];
+
+    if (locationIds.length === 0) {
+      return performWebSearch(query, count); // Fallback to web search
+    }
+
+    // Get POI details and descriptions in parallel
+    const [poisData, descriptionsData] = await Promise.all([
+      getPoisData(locationIds),
+      getDescriptionsData(locationIds)
+    ]);
+
+    return formatLocalResults(poisData, descriptionsData);
+  } catch (error) {
+    throw new Error(`Error in local search: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  const webData = await webResponse.json() as BraveWeb;
-  const locationIds = webData.locations?.results?.filter((r): r is {id: string; title?: string} => r.id != null).map(r => r.id) || [];
-
-  if (locationIds.length === 0) {
-    return performWebSearch(query, count); // Fallback to web search
-  }
-
-  // Get POI details and descriptions in parallel
-  const [poisData, descriptionsData] = await Promise.all([
-    getPoisData(locationIds),
-    getDescriptionsData(locationIds)
-  ]);
-
-  return formatLocalResults(poisData, descriptionsData);
 }
 
 async function getPoisData(ids: string[]): Promise<BravePoiResponse> {
